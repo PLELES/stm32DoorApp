@@ -15,8 +15,12 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: '阿里云 MQTT Demo',
-      theme: ThemeData(primarySwatch: Colors.blue),
+      debugShowCheckedModeBanner: false,
+      title: '智能门锁控制',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        brightness: Brightness.dark, // 黑色科技感主题
+      ),
       home: const AliCloudMqttPage(),
     );
   }
@@ -34,62 +38,97 @@ class _AliCloudMqttPageState extends State<AliCloudMqttPage> {
   final String productKey = "k1ws0VxImus";
   final String deviceName = "appDevice";
   final String deviceSecret = "3dd085aed29cb4947f79450065dfc956";
-  final String regionId = "cn-shanghai"; // 你的地域ID，比如 cn-shanghai, cn-hangzhou
+  final String regionId = "cn-shanghai";
   // ====================================================
 
   MqttServerClient? client;
   String connectionState = '未连接';
-  List<String> messages = [];
+  List<String> logs = [];
+  
+  // 业务相关变量
+  bool isLocked = true; // 门锁状态
+  String inputPassword = ""; // 当前输入的密码
 
-  // 获取阿里云服务器地址
   String get brokerUrl => "$productKey.iot-as-mqtt.$regionId.aliyuncs.com";
-  // 获取主题：这里填写你在阿里云后台创建或默认的 Topic
   String get subTopic => "/$productKey/$deviceName/user/get";
   String get pubTopic => "/$productKey/$deviceName/user/update";
 
   @override
   void initState() {
     super.initState();
+    // 自动连接
+    connectMqtt();
   }
 
-  /// 计算阿里云 MQTT 连接参数
+  // --- 核心业务逻辑 ---
+
+  /// 模拟开门动作
+  void _openDoor() {
+    setState(() {
+      isLocked = false;
+    });
+    // 3秒后自动重新上锁
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() => isLocked = true);
+      }
+    });
+  }
+
+  /// 处理矩阵键盘点击
+  void _handleKeyPress(String value) {
+    if (inputPassword.length < 6) {
+      setState(() {
+        inputPassword += value;
+      });
+    }
+  }
+
+  /// 删除最后一位
+  void _handleDelete() {
+    if (inputPassword.isNotEmpty) {
+      setState(() {
+        inputPassword = inputPassword.substring(0, inputPassword.length - 1);
+      });
+    }
+  }
+
+  /// 提交密码至阿里云
+  void _handleSubmit() {
+    if (inputPassword.isEmpty) return;
+    
+    final payload = jsonEncode({
+      "type": "password_verify",
+      "password": inputPassword,
+      "timestamp": DateTime.now().millisecondsSinceEpoch
+    });
+    
+    _publish(payload);
+    
+    setState(() {
+      logs.insert(0, "发送密码验证: $inputPassword");
+      inputPassword = ""; // 清空输入
+    });
+  }
+
+  // --- MQTT 基础方法 ---
+
   Map<String, String> generateAliyunMqttParams() {
-    // 1. 生成 clientId
-    // 格式：clientId+"|securemode=2,signmethod=hmacsha256,timestamp=1234567890|"
     final timestamp = DateTime.now().millisecondsSinceEpoch.toString();
     final clientId = "$deviceName|securemode=2,signmethod=hmacsha256,timestamp=$timestamp|";
-
-    // 2. 生成 username
-    // 格式：deviceName+"&"+productKey
     final username = "$deviceName&$productKey";
-
-    // 3. 生成 password (签名)
-    // 需要使用 HmacSHA256 加密 clientId+deviceName+productKey+timestamp
-    final content =
-        "clientId$deviceName" "deviceName$deviceName" "productKey$productKey" "timestamp$timestamp";
+    final content = "clientId$deviceName" "deviceName$deviceName" "productKey$productKey" "timestamp$timestamp";
     final hmacSha256 = Hmac(sha256, utf8.encode(deviceSecret));
-    final digest = hmacSha256.convert(utf8.encode(content));
-    final password = digest.toString().toUpperCase();
+    final password = hmacSha256.convert(utf8.encode(content)).toString().toUpperCase();
 
-    return {
-      'clientId': clientId,
-      'username': username,
-      'password': password,
-    };
+    return {'clientId': clientId, 'username': username, 'password': password};
   }
 
-  /// 连接 MQTT 并订阅
   Future<void> connectMqtt() async {
     final params = generateAliyunMqttParams();
-    
-    // 端口传 1883
     client = MqttServerClient.withPort(brokerUrl, params['clientId']!, 1883);
-
-    client?.logging(on: true);
-    client?.keepAlivePeriod = 60; // 阿里云要求保持在 60-300 秒间
-    client?.onDisconnected = onDisconnected;
-    client?.onConnected = onConnected;
-    client?.onSubscribed = onSubscribed;
+    client?.keepAlivePeriod = 60;
+    client?.onDisconnected = () => setState(() => connectionState = '连接断开');
 
     final connMessage = MqttConnectMessage()
         .withClientIdentifier(params['clientId']!)
@@ -98,111 +137,174 @@ class _AliCloudMqttPageState extends State<AliCloudMqttPage> {
     client?.connectionMessage = connMessage;
 
     try {
-      setState(() => connectionState = '连接中...');
+      setState(() => connectionState = '正在连接...');
       await client?.connect();
-    } catch (e) {
-      debugPrint('连接异常: $e');
-      client?.disconnect();
-      setState(() => connectionState = '连接异常: $e');
-    }
+      if (client?.connectionStatus!.state == MqttConnectionState.connected) {
+        setState(() => connectionState = '云端已就绪');
+        client?.subscribe(subTopic, MqttQos.atLeastOnce);
+        
+        // 监听消息
+        client?.updates!.listen((List<MqttReceivedMessage<MqttMessage>> c) {
+          final MqttPublishMessage message = c[0].payload as MqttPublishMessage;
+          final String payload = MqttPublishPayload.bytesToStringAsString(message.payload.message);
+          
+          setState(() => logs.insert(0, "收到指令: $payload"));
 
-    if (client?.connectionStatus!.state == MqttConnectionState.connected) {
-      setState(() => connectionState = '已连接');
-      
-      // 订阅主题 (Sub)
-      client?.subscribe(subTopic, MqttQos.atLeastOnce);
-
-      // 监听接收到的消息
-      client?.updates!.listen((List<MqttReceivedMessage<MqttMessage>> c) {
-        final MqttPublishMessage message = c[0].payload as MqttPublishMessage;
-        final String payload =
-            MqttPublishPayload.bytesToStringAsString(message.payload.message);
-
-        debugPrint('收到主题 ${c[0].topic} 的消息: $payload');
-        setState(() {
-          messages.insert(0, '收到数据: $payload');
+          // 1. 判断是否收到 unlock 指令
+          if (payload.contains("unlock")) {
+            _openDoor();
+          }
         });
-      });
-    } else {
-      setState(() => connectionState = '连接失败，状态: ${client?.connectionStatus!.state}');
-      client?.disconnect();
+      }
+    } catch (e) {
+      setState(() => connectionState = '连接失败');
     }
   }
 
-  /// 发布消息 (Pub)
-  void publishMessage() {
-    if (client?.connectionStatus!.state != MqttConnectionState.connected) {
-      debugPrint('尚未连接服务器');
-      return;
-    }
-
+  void _publish(String message) {
+    if (client?.connectionStatus!.state != MqttConnectionState.connected) return;
     final builder = MqttClientPayloadBuilder();
-    // 这里可以是普通的字符串，也可以是 JSON 格式（如物模型数据）
-    builder.addString('{"message": "Hello from Flutter", "value": 100}');
-
+    builder.addString(message);
     client?.publishMessage(pubTopic, MqttQos.atLeastOnce, builder.payload!);
-    
-    setState(() {
-      messages.insert(0, '发送数据至 $pubTopic 成功');
-    });
   }
 
-  void onConnected() {
-    debugPrint('MQTT 已连接');
-  }
-
-  void onDisconnected() {
-    debugPrint('MQTT 已断开');
-    setState(() => connectionState = '已断开');
-  }
-
-  void onSubscribed(String topic) {
-    debugPrint('已成功订阅主题: $topic');
-  }
-
-  @override
-  void dispose() {
-    client?.disconnect();
-    super.dispose();
-  }
+  // --- UI 组件 ---
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('阿里云 MQTT 连接演示')),
-      body: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          children: [
-            Text('状态: $connectionState', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 10),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                ElevatedButton(
-                  onPressed: connectMqtt,
-                  child: const Text('1. 连接并订阅'),
-                ),
-                ElevatedButton(
-                  onPressed: publishMessage,
-                  child: const Text('2. 发送(Pub)'),
-                ),
-              ],
+      backgroundColor: const Color(0xFF1A1A2E), // 深色背景
+      appBar: AppBar(
+        title: const Text('智能安全门锁'),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        actions: [
+          IconButton(icon: const Icon(Icons.refresh), onPressed: connectMqtt)
+        ],
+      ),
+      body: Column(
+        children: [
+          // 1. 状态指示器
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: Text(connectionState, style: TextStyle(color: connectionState == '云端已就绪' ? Colors.green : Colors.redAccent)),
+          ),
+
+          // 2. 门锁动态图标
+          const SizedBox(height: 20),
+          _buildLockAnimation(),
+          const SizedBox(height: 10),
+          Text(isLocked ? "已上锁" : "已开锁", style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+
+          // 3. 密码显示区域
+          const SizedBox(height: 30),
+          _buildPasswordDisplay(),
+
+          // 4. 矩阵键盘
+          const SizedBox(height: 20),
+          Expanded(child: _buildKeypad()),
+
+          // 5. 简易日志查看
+          Container(
+            height: 60,
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+            child: ListView.builder(
+              itemCount: logs.length > 3 ? 3 : logs.length,
+              itemBuilder: (context, i) => Text(logs[i], style: const TextStyle(fontSize: 10, color: Colors.grey)),
             ),
-            const Divider(),
-            Expanded(
-              child: ListView.builder(
-                itemCount: messages.length,
-                itemBuilder: (context, index) {
-                  return ListTile(
-                    title: Text(messages[index]),
-                  );
-                },
-              ),
-            ),
-          ],
+          )
+        ],
+      ),
+    );
+  }
+
+  /// 门锁动画组件
+  Widget _buildLockAnimation() {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 500),
+      padding: const EdgeInsets.all(30),
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: isLocked ? Colors.red.withOpacity(0.1) : Colors.green.withOpacity(0.1),
+        border: Border.all(color: isLocked ? Colors.red : Colors.green, width: 2),
+        boxShadow: [
+          BoxShadow(
+            color: isLocked ? Colors.red.withOpacity(0.3) : Colors.green.withOpacity(0.3),
+            blurRadius: 20,
+            spreadRadius: 5,
+          )
+        ],
+      ),
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 300),
+        transitionBuilder: (child, anim) => ScaleTransition(scale: anim, child: child),
+        child: Icon(
+          isLocked ? Icons.lock : Icons.lock_open,
+          key: ValueKey(isLocked),
+          size: 80,
+          color: isLocked ? Colors.red : Colors.green,
         ),
       ),
+    );
+  }
+
+  /// 密码点阵显示
+  Widget _buildPasswordDisplay() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: List.generate(6, (index) {
+        bool isFilled = index < inputPassword.length;
+        return Container(
+          margin: const EdgeInsets.symmetric(horizontal: 10),
+          width: 20,
+          height: 20,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: isFilled ? Colors.blueAccent : Colors.white12,
+            border: Border.all(color: Colors.blueAccent),
+          ),
+        );
+      }),
+    );
+  }
+
+  /// 矩阵键盘构建
+  Widget _buildKeypad() {
+    final keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'DEL', '0', 'OK'];
+    return GridView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 40),
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        childAspectRatio: 1.2,
+        crossAxisSpacing: 20,
+        mainAxisSpacing: 20,
+      ),
+      itemCount: keys.length,
+      itemBuilder: (context, index) {
+        String key = keys[index];
+        bool isSpecial = key == 'DEL' || key == 'OK';
+
+        return InkWell(
+          onTap: () {
+            if (key == 'DEL') _handleDelete();
+            else if (key == 'OK') _handleSubmit();
+            else _handleKeyPress(key);
+          },
+          borderRadius: BorderRadius.circular(50),
+          child: Container(
+            decoration: BoxDecoration(
+              color: isSpecial ? (key == 'OK' ? Colors.green : Colors.redAccent.withOpacity(0.8)) : Colors.white.withOpacity(0.05),
+              shape: BoxShape.circle,
+            ),
+            alignment: Alignment.center,
+            child: key == 'DEL' 
+              ? const Icon(Icons.backspace_outlined) 
+              : (key == 'OK' ? const Icon(Icons.check, size: 30) : Text(key, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold))),
+          ),
+        );
+      },
     );
   }
 }
