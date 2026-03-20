@@ -1,134 +1,132 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 
-void main() {
-  runApp(const MyApp());
-}
+void main() => runApp(const SensorDashboardApp());
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class SensorDashboardApp extends StatelessWidget {
+  const SensorDashboardApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: '智能门锁控制',
-      theme: ThemeData(
-        primarySwatch: Colors.blue,
-        brightness: Brightness.dark, // 黑色科技感主题
-      ),
-      home: const AliCloudMqttPage(),
+      theme: ThemeData(brightness: Brightness.dark, fontFamily: 'PingFang SC'),
+      home: const DashboardScreen(),
     );
   }
 }
 
-class AliCloudMqttPage extends StatefulWidget {
-  const AliCloudMqttPage({super.key});
+class DashboardScreen extends StatefulWidget {
+  const DashboardScreen({super.key});
 
   @override
-  State<AliCloudMqttPage> createState() => _AliCloudMqttPageState();
+  State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _AliCloudMqttPageState extends State<AliCloudMqttPage> {
-  // ================= 替换为你的设备信息 =================
-  final String productKey = "k1ws0VxImus";
-  final String deviceName = "appDevice";
-  final String deviceSecret = "3dd085aed29cb4947f79450065dfc956";
+class _DashboardScreenState extends State<DashboardScreen> {
+  // ================= 阿里云配置 =================
+  final String productKey = "k1ws0UwWsXY";
+  final String deviceName = "D-appDevice";
+
+  final String deviceSecret = "e6758d6825b924c9a8f4245b766ae305";
   final String regionId = "cn-shanghai";
-  // ====================================================
+
+  // 订阅主题 (设备下发消息)
+  String get subTopic => "/$productKey/$deviceName/user/get";
 
   MqttServerClient? client;
-  String connectionState = '未连接';
-  List<String> logs = [];
-  
-  // 业务相关变量
-  bool isLocked = true; // 门锁状态
-  String inputPassword = ""; // 当前输入的密码
+  String connectionStatusText = '尚未连接';
+  bool isConnecting = false;
 
-  String get brokerUrl => "$productKey.iot-as-mqtt.$regionId.aliyuncs.com";
-  String get subTopic => "/$productKey/$deviceName/user/get";
-  String get pubTopic => "/$productKey/$deviceName/user/update";
+  // 传感器当前数据
+  double currentTemp = 28.5;
+  double currentHumidity = 65.0;
+  double currentAirQuality = 120.0;
+  double currentLight = 800.0;
 
-  @override
-  void initState() {
-    super.initState();
-    // 自动连接
-    connectMqtt();
-  }
+  // 报警阈值 (支持解析 JSON 更新)
+  double thresholdTemp = 30.0;
+  double thresholdHumidity = 70.0;
+  double thresholdAirQuality = 100.0;
+  double thresholdLight = 1000.0;
 
-  // --- 核心业务逻辑 ---
+  bool get isConnected => 
+    client?.connectionStatus?.state == MqttConnectionState.connected;
 
-  /// 模拟开门动作
-  void _openDoor() {
+  // 数据收发记录
+  final List<String> _messages = [];
+  final ScrollController _scrollController = ScrollController();
+
+  void _addMessage(String msg) {
+    if (!mounted) return;
     setState(() {
-      isLocked = false;
+      _messages.add("${DateTime.now().toString().substring(11, 19)} $msg");
+      if (_messages.length > 100) _messages.removeAt(0); // 限制最多显示100条
     });
-    // 3秒后自动重新上锁
-    Future.delayed(const Duration(seconds: 3), () {
-      if (mounted) {
-        setState(() => isLocked = true);
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+        );
       }
     });
   }
 
-  /// 处理矩阵键盘点击
-  void _handleKeyPress(String value) {
-    if (inputPassword.length < 6) {
-      setState(() {
-        inputPassword += value;
-      });
-    }
-  }
-
-  /// 删除最后一位
-  void _handleDelete() {
-    if (inputPassword.isNotEmpty) {
-      setState(() {
-        inputPassword = inputPassword.substring(0, inputPassword.length - 1);
-      });
-    }
-  }
-
-  /// 提交密码至阿里云
-  void _handleSubmit() {
-    if (inputPassword.isEmpty) return;
-    
-    final payload = jsonEncode({
-      "type": "password_verify",
-      "password": inputPassword,
-      "timestamp": DateTime.now().millisecondsSinceEpoch
-    });
-    
-    _publish(payload);
-    
+  void _clearMessages() {
     setState(() {
-      logs.insert(0, "发送密码验证: $inputPassword");
-      inputPassword = ""; // 清空输入
+      _messages.clear();
     });
   }
 
-  // --- MQTT 基础方法 ---
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
 
-  Map<String, String> generateAliyunMqttParams() {
+  // --- MQTT 核心逻辑 ---
+
+  Map<String, String> _generateAliyunParams() {
     final timestamp = DateTime.now().millisecondsSinceEpoch.toString();
     final clientId = "$deviceName|securemode=2,signmethod=hmacsha256,timestamp=$timestamp|";
     final username = "$deviceName&$productKey";
     final content = "clientId$deviceName" "deviceName$deviceName" "productKey$productKey" "timestamp$timestamp";
     final hmacSha256 = Hmac(sha256, utf8.encode(deviceSecret));
     final password = hmacSha256.convert(utf8.encode(content)).toString().toUpperCase();
-
     return {'clientId': clientId, 'username': username, 'password': password};
   }
 
-  Future<void> connectMqtt() async {
-    final params = generateAliyunMqttParams();
-    client = MqttServerClient.withPort(brokerUrl, params['clientId']!, 1883);
+  Future<void> toggleConnection() async {
+    if (isConnected) {
+      client?.disconnect();
+      return;
+    }
+    await _doConnect();
+  }
+
+  Future<void> _doConnect() async {
+    setState(() {
+      isConnecting = true;
+      connectionStatusText = "正在握手...";
+    });
+
+    final params = _generateAliyunParams();
+    final broker = "$productKey.iot-as-mqtt.$regionId.aliyuncs.com";
+    
+    client = MqttServerClient.withPort(broker, params['clientId']!, 1883);
     client?.keepAlivePeriod = 60;
-    client?.onDisconnected = () => setState(() => connectionState = '连接断开');
+    client?.onDisconnected = () => setState(() => connectionStatusText = '已离线');
+    client?.onConnected = () {
+      setState(() => connectionStatusText = '云端在线');
+      _setupMessageListener(); 
+    };
 
     final connMessage = MqttConnectMessage()
         .withClientIdentifier(params['clientId']!)
@@ -137,174 +135,293 @@ class _AliCloudMqttPageState extends State<AliCloudMqttPage> {
     client?.connectionMessage = connMessage;
 
     try {
-      setState(() => connectionState = '正在连接...');
       await client?.connect();
-      if (client?.connectionStatus!.state == MqttConnectionState.connected) {
-        setState(() => connectionState = '云端已就绪');
-        client?.subscribe(subTopic, MqttQos.atLeastOnce);
-        
-        // 监听消息
-        client?.updates!.listen((List<MqttReceivedMessage<MqttMessage>> c) {
-          final MqttPublishMessage message = c[0].payload as MqttPublishMessage;
-          final String payload = MqttPublishPayload.bytesToStringAsString(message.payload.message);
-          
-          setState(() => logs.insert(0, "收到指令: $payload"));
-
-          // 1. 判断是否收到 unlock 指令
-          if (payload.contains("unlock")) {
-            _openDoor();
-          }
-        });
-      }
+      client?.subscribe(subTopic, MqttQos.atLeastOnce);
     } catch (e) {
-      setState(() => connectionState = '连接失败');
+      setState(() => connectionStatusText = '连接失败');
+      client?.disconnect();
+    } finally {
+      setState(() => isConnecting = false);
     }
   }
 
-  void _publish(String message) {
-    if (client?.connectionStatus!.state != MqttConnectionState.connected) return;
-    final builder = MqttClientPayloadBuilder();
-    builder.addString(message);
+  // 接收并解析 JSON 阈值
+  void _setupMessageListener() {
+    client?.updates!.listen((List<MqttReceivedMessage<MqttMessage>> c) {
+      final MqttPublishMessage recMess = c[0].payload as MqttPublishMessage;
+      final String payload = MqttPublishPayload.bytesToStringAsString(recMess.payload.message);
+
+      _addMessage("收到: $payload");
+
+      try {
+        final Map<String, dynamic> data = jsonDecode(payload);
+        if (data.containsKey('sensor')) {
+          final sensor = data['sensor'];
+          setState(() {
+            if (sensor['temp'] != null) currentTemp = sensor['temp'].toDouble();
+            if (sensor['humi'] != null) currentHumidity = sensor['humi'].toDouble();
+            if (sensor['light'] != null) currentLight = sensor['light'].toDouble();
+            if (sensor['air'] != null) currentAirQuality = sensor['air'].toDouble();
+          });
+        }
+
+        if (data.containsKey('thresholds')) {
+          final thr = data['thresholds'];
+          setState(() {
+            if (thr['temp'] != null) thresholdTemp = thr['temp'].toDouble();
+            if (thr['humi'] != null) thresholdHumidity = thr['humi'].toDouble();
+            if (thr['light'] != null) thresholdLight = thr['light'].toDouble();
+            if (thr['air'] != null) thresholdAirQuality = thr['air'].toDouble();
+          });
+        }
+      } catch (e) {
+        debugPrint('Parse Error: $e');
+      }
+    });
+  }
+
+  void _publishThreshold(String type, double value) {
+    if (!isConnected) return;
+    final pubTopic = "/$productKey/$deviceName/user/update";
+    final payload = jsonEncode({
+      "type": type,
+      "threshold": value.toStringAsFixed(1),
+    });
+    
+    _addMessage("发送: $payload");
+    
+    final builder = MqttClientPayloadBuilder()..addString(payload);
     client?.publishMessage(pubTopic, MqttQos.atLeastOnce, builder.payload!);
   }
 
-  // --- UI 组件 ---
+  // --- 优化后的 UI 组件 ---
+
+  Widget _buildConnectPanel() {
+    Color statusColor = isConnected ? Colors.greenAccent : (isConnecting ? Colors.orangeAccent : Colors.redAccent);
+    return Container(
+      margin: const EdgeInsets.all(16),
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E272E),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: statusColor.withOpacity(0.3)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 10, height: 10,
+            decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle, boxShadow: [BoxShadow(color: statusColor, blurRadius: 6)]),
+          ),
+          const SizedBox(width: 15),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text("CONNECTION STATUS", style: TextStyle(fontSize: 10, color: Colors.white38, letterSpacing: 1.2)),
+                Text(connectionStatusText, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              ],
+            ),
+          ),
+          ElevatedButton(
+            onPressed: isConnecting ? null : toggleConnection,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: isConnected ? Colors.redAccent.withOpacity(0.2) : Colors.blueAccent,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+            child: Text(isConnected ? "断开" : "连接"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // 增强版传感器卡片
+  Widget _buildSensorCard({
+    required String label,
+    required IconData icon,
+    required String type,
+    required double current,
+    required double threshold,
+    required String unit,
+    required double min,
+    required double max,
+    required Function(double) onUIChange,
+  }) {
+    bool isWarning = current > threshold;
+    Color themeColor = isWarning ? Colors.redAccent : Colors.cyanAccent;
+
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1F25),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: isWarning ? Colors.redAccent.withOpacity(0.4) : Colors.white.withOpacity(0.05)),
+      ),
+      child: Column(
+        children: [
+          // 第一行：图标 + 名称 + 警告标志
+          Row(
+            children: [
+              Icon(icon, color: Colors.white54, size: 20),
+              const SizedBox(width: 8),
+              Text(label, style: const TextStyle(color: Colors.white70, fontSize: 15)),
+              const Spacer(),
+              if (isWarning) 
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  decoration: BoxDecoration(color: Colors.redAccent, borderRadius: BorderRadius.circular(8)),
+                  child: const Text("超标", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          // 第二行：当前值 vs 阈值显示
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(current.toStringAsFixed(1), style: TextStyle(fontSize: 36, color: themeColor, fontWeight: FontWeight.bold, fontFamily: 'monospace')),
+              const SizedBox(width: 4),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(unit, style: const TextStyle(color: Colors.white24, fontSize: 14)),
+              ),
+              const Spacer(),
+              // 阈值显示区域
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  const Text("设定阈值", style: TextStyle(color: Colors.white38, fontSize: 11)),
+                  Text(threshold.toStringAsFixed(1), style: const TextStyle(color: Colors.orangeAccent, fontSize: 18, fontWeight: FontWeight.w500)),
+                ],
+              )
+            ],
+          ),
+          const SizedBox(height: 10),
+          // 第三行：调节滑块
+          SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              trackHeight: 2,
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+              overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+            ),
+            child: Slider(
+              value: threshold.clamp(min, max),
+              min: min, max: max,
+              activeColor: Colors.orangeAccent,
+              inactiveColor: Colors.white10,
+              onChanged: (v) => onUIChange(v),
+              onChangeEnd: (v) => _publishThreshold(type, v),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // 消息日志组件
+  Widget _buildMessageLog() {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E272E),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withOpacity(0.1)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text("收发日志", style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold)),
+              IconButton(
+                icon: const Icon(Icons.delete_outline, color: Colors.white54, size: 20),
+                onPressed: _clearMessages,
+                tooltip: "一键清除",
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Container(
+            height: 150,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.3),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: _messages.isEmpty
+                ? const Center(child: Text("暂无消息", style: TextStyle(color: Colors.white38)))
+                : ListView.builder(
+                    controller: _scrollController,
+                    itemCount: _messages.length,
+                    itemBuilder: (context, index) {
+                      final msg = _messages[index];
+                      // 简单区分收发颜色
+                      final isSend = msg.contains("发送:");
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 6),
+                        child: Text(
+                          msg,
+                          style: TextStyle(
+                            color: isSend ? Colors.blueAccent : Colors.greenAccent,
+                            fontSize: 12,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF1A1A2E), // 深色背景
+      backgroundColor: const Color(0xFF0F1216),
       appBar: AppBar(
-        title: const Text('智能安全门锁'),
-        backgroundColor: Colors.transparent,
+        title: const Text("IoT 环境控制台", style: TextStyle(fontWeight: FontWeight.bold)),
+        centerTitle: true,
         elevation: 0,
-        actions: [
-          IconButton(icon: const Icon(Icons.refresh), onPressed: connectMqtt)
-        ],
+        backgroundColor: Colors.transparent,
       ),
-      body: Column(
-        children: [
-          // 1. 状态指示器
-          Padding(
-            padding: const EdgeInsets.all(8.0),
-            child: Text(connectionState, style: TextStyle(color: connectionState == '云端已就绪' ? Colors.green : Colors.redAccent)),
-          ),
-
-          // 2. 门锁动态图标
-          const SizedBox(height: 20),
-          _buildLockAnimation(),
-          const SizedBox(height: 10),
-          Text(isLocked ? "已上锁" : "已开锁", style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-
-          // 3. 密码显示区域
-          const SizedBox(height: 30),
-          _buildPasswordDisplay(),
-
-          // 4. 矩阵键盘
-          const SizedBox(height: 20),
-          Expanded(child: _buildKeypad()),
-
-          // 5. 简易日志查看
-          Container(
-            height: 60,
-            padding: const EdgeInsets.symmetric(horizontal: 20),
-            child: ListView.builder(
-              itemCount: logs.length > 3 ? 3 : logs.length,
-              itemBuilder: (context, i) => Text(logs[i], style: const TextStyle(fontSize: 10, color: Colors.grey)),
+      body: SingleChildScrollView(
+        physics: const BouncingScrollPhysics(),
+        child: Column(
+          children: [
+            _buildConnectPanel(),
+            _buildSensorCard(
+              label: '环境温度', icon: Icons.thermostat, type: 'temp', 
+              current: currentTemp, threshold: thresholdTemp, unit: '℃', 
+              min: -10, max: 50, onUIChange: (v) => setState(() => thresholdTemp = v),
             ),
-          )
-        ],
-      ),
-    );
-  }
-
-  /// 门锁动画组件
-  Widget _buildLockAnimation() {
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 500),
-      padding: const EdgeInsets.all(30),
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        color: isLocked ? Colors.red.withOpacity(0.1) : Colors.green.withOpacity(0.1),
-        border: Border.all(color: isLocked ? Colors.red : Colors.green, width: 2),
-        boxShadow: [
-          BoxShadow(
-            color: isLocked ? Colors.red.withOpacity(0.3) : Colors.green.withOpacity(0.3),
-            blurRadius: 20,
-            spreadRadius: 5,
-          )
-        ],
-      ),
-      child: AnimatedSwitcher(
-        duration: const Duration(milliseconds: 300),
-        transitionBuilder: (child, anim) => ScaleTransition(scale: anim, child: child),
-        child: Icon(
-          isLocked ? Icons.lock : Icons.lock_open,
-          key: ValueKey(isLocked),
-          size: 80,
-          color: isLocked ? Colors.red : Colors.green,
+            _buildSensorCard(
+              label: '相对湿度', icon: Icons.water_drop, type: 'humi', 
+              current: currentHumidity, threshold: thresholdHumidity, unit: '%', 
+              min: 0, max: 100, onUIChange: (v) => setState(() => thresholdHumidity = v),
+            ),
+            _buildSensorCard(
+              label: '空气质量', icon: Icons.air, type: 'air', 
+              current: currentAirQuality, threshold: thresholdAirQuality, unit: 'AQI', 
+              min: 0, max: 500, onUIChange: (v) => setState(() => thresholdAirQuality = v),
+            ),
+            _buildSensorCard(
+              label: '光照强度', icon: Icons.light_mode, type: 'light', 
+              current: currentLight, threshold: thresholdLight, unit: 'Lux', 
+              min: 0, max: 2000, onUIChange: (v) => setState(() => thresholdLight = v),
+            ),
+            _buildMessageLog(),
+            const SizedBox(height: 50),
+          ],
         ),
       ),
-    );
-  }
-
-  /// 密码点阵显示
-  Widget _buildPasswordDisplay() {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: List.generate(6, (index) {
-        bool isFilled = index < inputPassword.length;
-        return Container(
-          margin: const EdgeInsets.symmetric(horizontal: 10),
-          width: 20,
-          height: 20,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: isFilled ? Colors.blueAccent : Colors.white12,
-            border: Border.all(color: Colors.blueAccent),
-          ),
-        );
-      }),
-    );
-  }
-
-  /// 矩阵键盘构建
-  Widget _buildKeypad() {
-    final keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'DEL', '0', 'OK'];
-    return GridView.builder(
-      padding: const EdgeInsets.symmetric(horizontal: 40),
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 3,
-        childAspectRatio: 1.2,
-        crossAxisSpacing: 20,
-        mainAxisSpacing: 20,
-      ),
-      itemCount: keys.length,
-      itemBuilder: (context, index) {
-        String key = keys[index];
-        bool isSpecial = key == 'DEL' || key == 'OK';
-
-        return InkWell(
-          onTap: () {
-            if (key == 'DEL') _handleDelete();
-            else if (key == 'OK') _handleSubmit();
-            else _handleKeyPress(key);
-          },
-          borderRadius: BorderRadius.circular(50),
-          child: Container(
-            decoration: BoxDecoration(
-              color: isSpecial ? (key == 'OK' ? Colors.green : Colors.redAccent.withOpacity(0.8)) : Colors.white.withOpacity(0.05),
-              shape: BoxShape.circle,
-            ),
-            alignment: Alignment.center,
-            child: key == 'DEL' 
-              ? const Icon(Icons.backspace_outlined) 
-              : (key == 'OK' ? const Icon(Icons.check, size: 30) : Text(key, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold))),
-          ),
-        );
-      },
     );
   }
 }
